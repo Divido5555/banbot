@@ -3,6 +3,7 @@ package exg
 import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
+	"github.com/banbox/banexg/sstwap"
 )
 
 type BotExchange struct {
@@ -25,6 +26,7 @@ type PutOrderRes struct {
 }
 
 func (e *BotExchange) CreateOrder(symbol, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
+	params = sstwap.EnrichOrderParams(params)
 	order, err := e.BanExchange.CreateOrder(symbol, odType, side, amount, price, params)
 	if AfterCreateOrder != nil {
 		err2 := AfterCreateOrder(&PutOrderRes{

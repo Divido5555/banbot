@@ -51,7 +51,7 @@ func getPriceBySide(ask, bid map[string]*core.Int64Flt, lock *sync.RWMutex, symb
 }
 
 func GetPriceSafeExp(symbol string, side string, expMS int64) float64 {
-	if core.IsFiat(symbol) && !strings.Contains(symbol, "/") {
+	if !strings.Contains(symbol, "/") && (core.IsFiat(symbol) || symbol == "DAI") {
 		return 1
 	}
 	price, ok := getPriceBySide(askPrices, bidPrices, &lockPrices, symbol, side, expMS)

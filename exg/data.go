@@ -14,4 +14,5 @@ var AllowExgIds = map[string]bool{
 	"okx":     true,
 	"bybit":   true,
 	"china":   true,
+	"sstwap":  true,
 }

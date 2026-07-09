@@ -1884,6 +1884,7 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 	if retryNum > 0 {
 		params[banexg.ParamRetry] = int(retryNum)
 	}
+	exg.AttachSstwapOrderParams(od.EnterTag, od.GetInfoString, params)
 	res, err := exchange.CreateOrder(od.Symbol, subOd.OrderType, side, amount, price, params)
 	if err != nil {
 		if !isEnter && err.BizCode == -2022 {
