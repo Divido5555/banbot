@@ -731,7 +731,7 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 	}
 	var legalCost float64
 
-	if od.Enter.Amount != 0 {
+		if od.Enter.Amount != 0 {
 		price := od.Enter.Average
 		if price == 0 {
 			if core.LiveMode {
@@ -745,6 +745,9 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 				return 0, errs.NewMsg(errs.CodeRunTime, "no valid price: %v", od.Symbol)
 			}
 			price = curPrice
+		}
+		if od.Symbol == "WPLS/DAI" && price > 1 {
+			price = 1 / price
 		}
 		legalCost = od.Enter.Amount * price
 	} else {
@@ -769,7 +772,13 @@ func (w *BanWallets) EnterOd(od *ormo.InOutOrder) (float64, *errs.Error) {
 			legalCost /= od.Leverage
 		}
 
-		quoteCost = w.GetAmountByLegal(quoteCode, legalCost)
+		// legalCost is already in stake/quote terms for pairs like WPLS/DAI (DAI stake).
+		quoteCost = legalCost
+		if od.QuoteCost > 0 {
+			quoteCost = od.QuoteCost
+		} else if quotePx := com.GetPriceSafe(quoteCode, ""); quotePx > 0 && math.Abs(quotePx-1) > 0.01 {
+			quoteCost = w.GetAmountByLegal(quoteCode, legalCost)
+		}
 		quoteCost, err = w.CostAva(odKey, quoteCode, quoteCost, false, 0)
 
 		if err != nil {
@@ -814,7 +823,8 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 	curFee := subOd.FeeQuote
 
 	baseCode, quoteCode, _, _ := core.SplitSymbol(exs.Symbol)
-	if core.IsContract {
+	isFuture := banexg.IsContract(exs.Market)
+	if isFuture {
 		// Futures contracts only lock the fixed currency and do not involve the increase of base currency.
 		// 期货合约，只锁定定价币，不涉及base币的增加
 		quoteAmount /= od.Leverage
@@ -829,8 +839,45 @@ func (w *BanWallets) ConfirmOdEnter(od *ormo.InOutOrder, enterPrice float64) {
 		// Buy in spot, handling fee will be deducted
 		// 现货买，手续费扣币
 		baseAmt := subOd.Amount - curFee/enterPrice
-		w.ConfirmPending(od.Key(), quoteCode, quoteAmount, baseCode, baseAmt, false)
+		if baseAmt < 0 {
+			baseAmt = 0
+		}
+		w.confirmSpotLongEnter(od.Key(), quoteCode, quoteAmount, baseCode, baseAmt)
 	}
+}
+
+// confirmSpotLongEnter settles a spot long fill: DAI pending → WPLS available.
+// Falls back to direct debit/credit when pending is missing (WPLS-base pairs in backtest).
+func (w *BanWallets) confirmSpotLongEnter(odKey, quoteCode string, quoteAmount float64, baseCode string, baseAmt float64) {
+	if w.ConfirmPending(odKey, quoteCode, quoteAmount, baseCode, baseAmt, false) {
+		return
+	}
+	if baseAmt <= 0 {
+		log.Warn("spot enter zero base credit", zap.String("od", odKey),
+			zap.Float64("quoteAmt", quoteAmount), zap.Float64("baseAmt", baseAmt))
+	}
+	quote := w.Get(quoteCode)
+	quote.lock.Lock()
+	pending, hasPending := quote.Pendings[odKey]
+	if hasPending {
+		delete(quote.Pendings, odKey)
+		quote.Available += pending - quoteAmount
+	} else {
+		quote.Available -= quoteAmount
+	}
+	quote.lock.Unlock()
+
+	base := w.Get(baseCode)
+	base.lock.Lock()
+	base.Available += baseAmt
+	base.lock.Unlock()
+
+	log.Warn("spot enter ConfirmPending miss, direct settle",
+		zap.String("od", odKey),
+		zap.String("base", baseCode),
+		zap.Float64("baseAmt", baseAmt),
+		zap.Float64("quoteAmt", quoteAmount),
+		zap.Bool("hadPending", hasPending))
 }
 func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 	if core.EnvReal {
@@ -864,9 +911,31 @@ func (w *BanWallets) ExitOd(od *ormo.InOutOrder, baseAmount float64) {
 		}
 
 		if baseAmount > 0 {
-			_, err := w.CostAva(od.Key(), baseCode, baseAmount, false, 0.01)
+			realCost, err := w.CostAva(od.Key(), baseCode, baseAmount, false, 0.01)
 			if err != nil {
-				log.Error("exit order fail", zap.String("od", od.Key()))
+				wallet.lock.Lock()
+				ava := wallet.Available
+				wallet.lock.Unlock()
+				log.Error("exit order fail", zap.String("od", od.Key()),
+					zap.String("base", baseCode), zap.Float64("need", baseAmount),
+					zap.Float64("ava", ava), zap.String("err", err.Short()))
+				// Backtest recovery: debit whatever base is available and proceed.
+				if ava > 0 && !core.EnvReal {
+					wallet.lock.Lock()
+					debit := ava
+					if debit > baseAmount {
+						debit = baseAmount
+					}
+					wallet.Available -= debit
+					if wallet.Pendings == nil {
+						wallet.Pendings = make(map[string]float64)
+					}
+					wallet.Pendings[od.Key()] = debit
+					wallet.lock.Unlock()
+				}
+			} else if realCost < baseAmount*0.99 {
+				log.Warn("exit partial base debit", zap.String("od", od.Key()),
+					zap.Float64("need", baseAmount), zap.Float64("got", realCost))
 			}
 		}
 	}

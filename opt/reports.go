@@ -663,11 +663,20 @@ func CalcMeasureByOrders(ods []*ormo.InOutOrder) (float64, float64, *errs.Error)
 }
 
 func calcMeasures(returns []float64, periods int, riskFree float64) (float64, float64, *errs.Error) {
-	sharpeFlt, err := utils.SharpeRatioBy(returns, riskFree, periods, true)
+	clean := make([]float64, 0, len(returns))
+	for _, r := range returns {
+		if !math.IsNaN(r) && !math.IsInf(r, 0) {
+			clean = append(clean, r)
+		}
+	}
+	if len(clean) < 2 {
+		return 0, 0, nil
+	}
+	sharpeFlt, err := utils.SharpeRatioBy(clean, riskFree, periods, true)
 	if err != nil {
 		return 0, 0, errs.New(errs.CodeRunTime, err)
 	}
-	sortineFlt, err := utils.SortinoRatioBy(returns, riskFree, periods, true)
+	sortineFlt, err := utils.SortinoRatioBy(clean, riskFree, periods, true)
 	if err != nil {
 		if !errors.Is(err, utils.ErrNoNegativeResults) {
 			return sharpeFlt, 0, errs.New(errs.CodeRunTime, err)

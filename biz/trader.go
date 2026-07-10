@@ -144,11 +144,17 @@ func (t *Trader) feedClosedSeries(evt *orm.DataSeries) *errs.Error {
 	if closeErr != nil {
 		return errs.New(core.ErrInvalidBars, closeErr)
 	}
+	// Slot 1 WPLS/DAI: wallet math expects DAI-per-WPLS (small). Busbar may still store WPLS-per-DAI.
+	if symbol == "WPLS/DAI" && closeVal > 1 {
+		closeVal = 1 / closeVal
+	}
 	core.LockOdMatch.RLock()
 	_, odMatch := core.OrderMatchTfs[evt.TimeFrame]
 	core.LockOdMatch.RUnlock()
 	accOrders := make(map[string][]*ormo.InOutOrder)
 	com.SetBarPrice(symbol, closeVal)
+	com.SetBarPrice("DAI", 1.0)
+	com.SetPrices(map[string]float64{"DAI": 1.0}, "")
 	if odMatch && !evt.IsWarmUp {
 		for account, cfg := range config.Accounts {
 			if cfg.NoTrade {

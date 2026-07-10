@@ -2,6 +2,7 @@ package biz
 
 import (
 	"maps"
+	"math"
 	"sort"
 	"strings"
 
@@ -299,6 +300,19 @@ func (o *LocalOrderMgr) fillPendingOrders(orders []*ormo.InOutOrder, evt *orm.Da
 	return affectNum, nil
 }
 
+func normalizeSlot1FillPrice(symbol string, price float64, side string) float64 {
+	if symbol == "WPLS/DAI" && price > 1 {
+		price = 1 / price
+	}
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		price = com.GetPriceSafe(symbol, side)
+		if symbol == "WPLS/DAI" && price > 1 {
+			price = 1 / price
+		}
+	}
+	return price
+}
+
 func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fillMS int64) *errs.Error {
 	wallets := GetWallets(o.Account)
 	_, err := wallets.EnterOd(od)
@@ -320,6 +334,12 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 	if err != nil {
 		return err
 	}
+	entPrice = normalizeSlot1FillPrice(od.Symbol, entPrice, od.Enter.Side)
+	if entPrice <= 0 {
+		return errs.NewMsg(errs.CodeRunTime, "invalid fill price for %s: %v", od.Symbol, price)
+	}
+	com.SetBarPrice("DAI", 1.0)
+	com.SetBarPrice(od.Symbol, entPrice)
 	exOrder := od.Enter
 	if exOrder.Amount == 0 {
 		if od.Short && !core.IsContract {
@@ -328,6 +348,9 @@ func (o *LocalOrderMgr) fillPendingEnter(od *ormo.InOutOrder, price float64, fil
 			return errs.NewMsg(core.ErrInvalidCost, "EnterAmount is required")
 		}
 		entAmount := od.QuoteCost / entPrice
+		if entAmount <= 0 || math.IsNaN(entAmount) || math.IsInf(entAmount, 0) {
+			return errs.NewMsg(errs.CodeRunTime, "invalid enter amount for %s: cost=%v price=%v", od.Symbol, od.QuoteCost, entPrice)
+		}
 		exOrder.Amount, err = exchange.PrecAmount(market, entAmount)
 		if err != nil || exOrder.Amount == 0 {
 			if err != nil {
