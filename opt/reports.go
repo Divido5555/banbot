@@ -441,6 +441,10 @@ func (r *BTResult) groupByProfits(orders []*ormo.InOutOrder) {
 	res := utils.KMeansVals(rates, clsNum)
 	var grpTitles = make([]string, 0, len(res.Clusters))
 	for _, gp := range res.Clusters {
+		if len(gp.Items) == 0 {
+			grpTitles = append(grpTitles, "0.00 ~ 0.00%")
+			continue
+		}
 		minPct := strconv.FormatFloat(slices.Min(gp.Items)*100, 'f', 2, 64)
 		maxPct := strconv.FormatFloat(slices.Max(gp.Items)*100, 'f', 2, 64)
 		grpTitles = append(grpTitles, fmt.Sprintf("%s ~ %s%%", minPct, maxPct))
