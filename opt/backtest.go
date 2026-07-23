@@ -391,6 +391,14 @@ func RefreshPairJobs(dp data.IProvider, showLog, isFirst bool, pBar *utils.Stage
 		return err
 	}
 	orm.ResetSubSymbol()
+	// Live container restarts can leave AccJobs warm in QuestDB while pairTfs returns empty;
+	// always ensure configured pairs stay subscribed to the spider.
+	if core.EnvReal && len(warms) == 0 && len(pairs) > 0 {
+		warms = make(map[string]map[string]int, len(pairs))
+		for _, p := range pairs {
+			warms[p] = map[string]int{"1m": 0}
+		}
+	}
 	// warm up for new symbols
 	return dp.SubWarmPairs(warms, true)
 }

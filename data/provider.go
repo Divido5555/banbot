@@ -524,52 +524,53 @@ func NewLiveProvider(callBack FnDataSeries, envEnd FuncEnvEnd) (*LiveProvider, *
 }
 
 func (p *LiveProvider) SubWarmPairs(items map[string]map[string]int, delOther bool) *errs.Error {
-	newHolds, sinceMap, delPairs, err := p.Provider.SubWarmPairs(items, delOther, nil)
+	_, sinceMap, delPairs, err := p.Provider.SubWarmPairs(items, delOther, nil)
 	if err != nil {
 		return err
 	}
-	if len(newHolds) > 0 {
-		var jobs []WatchJob
-		var minSince = btime.UTCStamp()
-		for _, h := range newHolds {
-			sta := h.getStates()[0]
-			symbol := h.getSymbol()
-			since, ok := sinceMap[symbol]
-			if ok {
-				minSince = min(minSince, since)
-			}
-			if sta.TFSecs >= 3600 {
-				exs, err := orm.GetExSymbolCur(symbol)
-				if err != nil {
-					return err
-				}
-				orm.AddHourSymbol(exs)
-			} else {
-				if ok {
-					jobs = append(jobs, WatchJob{
-						Symbol:    symbol,
-						TimeFrame: sta.TimeFrame,
-						Since:     since,
-					})
-				}
-				orm.Sub1mSymbol(symbol)
+	// Always (re)subscribe spider ohlcv for every warmed pair — not only net-new holders.
+	// Container restarts leave QuestDB warm state but drop spider miners; gating on newHolds left live blind.
+	var jobs []WatchJob
+	for symbol, tfMap := range items {
+		var tf string
+		minSecs := math.MaxInt
+		for t := range tfMap {
+			sec := utils2.TFToSecs(t)
+			if sec > 0 && sec < minSecs {
+				minSecs = sec
+				tf = t
 			}
 		}
-		if len(jobs) > 0 {
-			err = p.WatchJobs(core.ExgName, core.Market, "ohlcv", jobs...)
+		if tf == "" {
+			continue
+		}
+		if minSecs >= 3600 {
+			exs, err := orm.GetExSymbolCur(symbol)
 			if err != nil {
 				return err
 			}
+			orm.AddHourSymbol(exs)
+			continue
 		}
-		for msgType, pairMap := range strat.WsSubJobs {
-			jobs = make([]WatchJob, 0, len(pairMap))
-			for pair := range pairMap {
-				jobs = append(jobs, WatchJob{Symbol: pair, TimeFrame: "1m"})
-			}
-			err = p.WatchJobs(core.ExgName, core.Market, msgType, jobs...)
-			if err != nil {
-				return err
-			}
+		since := sinceMap[symbol]
+		if since <= 0 {
+			since = btime.UTCStamp() - int64(90*24*60*60*1000)
+		}
+		jobs = append(jobs, WatchJob{Symbol: symbol, TimeFrame: tf, Since: since})
+		orm.Sub1mSymbol(symbol)
+	}
+	if len(jobs) > 0 {
+		if err = p.WatchJobs(core.ExgName, core.Market, "ohlcv", jobs...); err != nil {
+			return err
+		}
+	}
+	for msgType, pairMap := range strat.WsSubJobs {
+		wsJobs := make([]WatchJob, 0, len(pairMap))
+		for pair := range pairMap {
+			wsJobs = append(wsJobs, WatchJob{Symbol: pair, TimeFrame: "1m"})
+		}
+		if err = p.WatchJobs(core.ExgName, core.Market, msgType, wsJobs...); err != nil {
+			return err
 		}
 	}
 	if len(delPairs) > 0 {

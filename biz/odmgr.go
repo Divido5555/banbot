@@ -565,6 +565,11 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 			fields := req.GetZapFields(nil, zap.String("acc", o.Account), zap.String("pair", pairs),
 				zap.Int("all", len(openOds)))
 			log.Warn("no match orders to exit", fields...)
+			// Ghost hygiene: open ODs skipped only because ExitTag/Exit.Amount was already
+			// set never reach FullExit → sticky HasLongOnLane / accOdNums. LocalExit them.
+			if cleared := o.clearPhantomExitStuck(pairs, req); len(cleared) > 0 {
+				return cleared, nil
+			}
 		}
 		return nil, nil
 	}
@@ -855,6 +860,79 @@ func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 		}
 	}
 	return err
+}
+
+// clearPhantomExitStuck LocalExits open orders that match the exit request filters
+// except they were skipped because ExitTag / Exit.Amount was already set without FullExit.
+// Pool-agnostic book hygiene — does not inspect chain inventory or pair symbols beyond the request.
+func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*ormo.InOutOrder {
+	if req == nil || req.OrderID > 0 {
+		return nil
+	}
+	parts := strings.Split(pairs, ",")
+	pairMap := make(map[string]bool)
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		pairMap[p] = true
+	}
+	dirtBoth := req.Dirt == core.OdDirtBoth
+	isShort := req.Dirt == core.OdDirtShort
+
+	openOds, lock := ormo.GetOpenODs(o.Account)
+	lock.Lock()
+	var phantoms []*ormo.InOutOrder
+	for _, od := range openOds {
+		if od == nil || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		if req.StratName != "" && od.Strategy != req.StratName {
+			continue
+		}
+		if len(pairMap) > 0 {
+			if _, ok := pairMap[od.Symbol]; !ok {
+				continue
+			}
+		}
+		if !dirtBoth && isShort != od.Short {
+			continue
+		}
+		if req.EnterTag != "" && od.EnterTag != req.EnterTag {
+			continue
+		}
+		stuck := od.ExitTag != "" || (od.Exit != nil && od.Exit.Amount > 0)
+		if !stuck {
+			continue
+		}
+		phantoms = append(phantoms, od)
+	}
+	lock.Unlock()
+
+	if len(phantoms) == 0 {
+		return nil
+	}
+
+	cleared := make([]*ormo.InOutOrder, 0, len(phantoms))
+	keys := make([]string, 0, len(phantoms))
+	for _, od := range phantoms {
+		err := od.LocalExit(0, core.ExitTagNoMatch, 0, "phantom_exit_stuck", "")
+		if err != nil {
+			log.Error("clear phantom exit stuck fail", zap.String("acc", o.Account),
+				zap.String("key", od.Key()), zap.Error(err))
+			continue
+		}
+		strat.FireOdChange(o.Account, od, strat.OdChgExitFill)
+		cleared = append(cleared, od)
+		keys = append(keys, od.Key())
+	}
+	if len(cleared) > 0 {
+		log.Warn("cleared phantom exit-stuck open orders",
+			zap.String("acc", o.Account),
+			zap.Int("n", len(cleared)),
+			zap.Strings("orders", keys))
+	}
+	return cleared
 }
 
 func (o *OrderMgr) CleanUp() *errs.Error {

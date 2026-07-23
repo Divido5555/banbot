@@ -928,8 +928,15 @@ func (r *BTResult) DumpCharts() {
 }
 
 func (r *BTResult) Score() float64 {
+	if ScoreFromBT != nil {
+		return ScoreFromBT(r)
+	}
 	return CalcBtScore(r.TotProfitPct, r.ShowDrawDownPct)
 }
+
+// ScoreFromBT optionally overrides hyperopt / picker backtest scoring (e.g. Σ log(1+r)).
+// Set from strategy packages in init(); when nil, CalcBtScore(profit, drawdown) is used.
+var ScoreFromBT func(r *BTResult) float64
 
 func (r *BTResult) dumpDetail(outPath string) {
 	if outPath == "" {

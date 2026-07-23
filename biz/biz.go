@@ -153,6 +153,14 @@ func RefreshPairs(showLog bool, timeMS int64, pBar *utils.StagedPrg) ([]string, 
 	if err != nil {
 		return nil, nil, err
 	}
+	// Policy-forced pairs must get a tradable TF even when kline quality scores thin/flat MM bars low.
+	// Empty or missing scores left AccJobs unloadable → spider could poll while OnBar never ran.
+	for _, pair := range allPairs {
+		scores := pairTfScores[pair]
+		if len(scores) == 0 {
+			pairTfScores[pair] = map[string]float64{"1m": 1.0}
+		}
+	}
 	if pBar != nil {
 		pBar.SetProgress("tfScores", 1)
 	}

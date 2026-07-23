@@ -1138,8 +1138,15 @@ func (w *BanWallets) calcLegal(kind LegalValueKind, symbols []string, withUPol b
 	for key, item := range data {
 		var price = com.GetPriceSafe(key, "")
 		if price == -1 {
-			skips = append(skips, key)
-			continue
+			// Stake stables (DAI on Slot1) often have no USD tick — treat as 1:1 legal.
+			// Without this, TotalLegal≈0 and FatalStop reports "Loss of 100%" forever.
+			switch key {
+			case "DAI", "USDT", "USDC", "USDL", "USD":
+				price = 1
+			default:
+				skips = append(skips, key)
+				continue
+			}
 		}
 		var amount float64
 		switch kind {

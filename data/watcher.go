@@ -141,10 +141,8 @@ func (w *SeriesWatcher) WatchJobs(exgName, marketType, jobType string, jobs ...W
 	}
 	exgID := exchange.Info().ID
 	for _, j := range jobs {
-		job := w.GetJob(jobType, j.Symbol)
-		if job != nil {
-			continue
-		}
+		// Always (re)send watch_pairs — cast/docker restart wipes spider miners while the
+		// trade-side job map can still look "subscribed". Skipping existing jobs left live blind.
 		tfSecs := utils2.TFToSecs(j.TimeFrame)
 		minTfSecs = min(minTfSecs, tfSecs)
 		if strings.HasSuffix(prefix, "_") {

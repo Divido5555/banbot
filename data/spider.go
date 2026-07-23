@@ -695,8 +695,8 @@ func (m *Miner) startLoopKLines() {
 	mntMSecs := int64(60000)
 	curTF := "1m"
 	prefix := fmt.Sprintf("ohlcv_%s_%s_", m.ExgName, m.Market)
-	// 刷新K线
-	com.Cron().AddFunc("0 * * * * *", func() {
+	// Refresh klines every 15s so live bars arrive before the 60s order gate.
+	com.Cron().AddFunc("*/15 * * * * *", func() {
 		pairs := m.KLineApis.KeyMap()
 		if len(pairs) == 0 {
 			return

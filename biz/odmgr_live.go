@@ -274,13 +274,15 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 	task := ormo.GetTask(o.Account)
 	// Get the exchange order
 	// 获取交易所挂单
-	exOdList, err := exchange.FetchOpenOrders("", task.CreateAt, 1000, map[string]interface{}{
+		exOdList, err := exchange.FetchOpenOrders("", task.CreateAt, 1000, map[string]interface{}{
 		banexg.ParamAccount:     o.Account,
 		banexg.ParamSettleCoins: config.StakeCurrency,
 	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	log.Info("SyncExgOrders FetchOpenOrders", zap.String("acc", o.Account),
+		zap.Int("n", len(exOdList)), zap.Int64("since", task.CreateAt))
 	exgOdMap := make(map[string]*banexg.Order)
 	for _, od := range exOdList {
 		exgOdMap[od.ID] = od
@@ -320,11 +322,68 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		delSaveOrders(o.Account, delOds, saveOds)
 	}
 	if !banexg.IsContract(core.Market) {
-		// 非合约市场，无法获取仓位，直接返回
+		// Spot (SSTWAP): adopt untracked FetchOpenOrders when take_over_strat is set.
+		// Contract markets use positions below; spot has no FetchPositions.
+		var newSpot []*ormo.InOutOrder
+		if config.TakeOverStrat != "" {
+			tracked := make(map[string]bool)
+			lock.Lock()
+			for _, od := range openOds {
+				if od.Enter != nil && od.Enter.OrderID != "" {
+					tracked[od.Enter.OrderID] = true
+				}
+			}
+			lock.Unlock()
+			for _, exOd := range exOdList {
+				if exOd == nil || tracked[exOd.ID] || exOd.Filled <= AmtDust {
+					continue
+				}
+				if exOd.Average <= 0 {
+					// Cost-basis missing — stamp live mark so take-over still books.
+					if px := com.GetPriceSafe(exOd.Symbol, ""); px > 0 {
+						exOd.Average = px
+						exOd.Price = px
+					}
+				}
+				exs, exsErr := orm.GetExSymbolCur(exOd.Symbol)
+				if exsErr != nil {
+					log.Error("take over spot: symbol fail", zap.String("acc", o.Account),
+						zap.String("symbol", exOd.Symbol), zap.Error(exsErr))
+					continue
+				}
+				defTF := config.GetTakeOverTF(exOd.Symbol, "1m")
+				if defTF == "" {
+					defTF = "1m"
+				}
+				feeName, feeCost, feeQuote := getFeeNameCost(exOd.Fee, exOd.Symbol, "", exOd.Side, exOd.Filled, exOd.Average)
+				iod := o.createInOutOd(exs, false, exOd.Average, exOd.Filled, exOd.Type, feeCost, feeQuote, feeName,
+					exOd.Timestamp, ormo.OdStatusClosed, exOd.ID, defTF)
+				if laneID, ok := parseSstwapLaneOrderID(exOd.ID); ok {
+					iod.EnterTag = fmt.Sprintf("L%d_in", laneID)
+					if iod.Info == nil {
+						iod.Info = map[string]interface{}{}
+					}
+					iod.Info["laneId"] = fmt.Sprintf("%d", laneID)
+					iod.DirtyMain = true
+					iod.DirtyInfo = true
+				}
+				if saveErr := iod.Save(); saveErr != nil {
+					log.Error("take over spot: save fail", zap.String("acc", o.Account), zap.Error(saveErr))
+					continue
+				}
+				lock.Lock()
+				openOds[iod.ID] = iod
+				lock.Unlock()
+				newSpot = append(newSpot, iod)
+				log.Info("take over spot open order", zap.String("acc", o.Account),
+					zap.String("key", iod.Key()), zap.String("exgId", exOd.ID),
+					zap.Float64("filled", exOd.Filled), zap.Float64("avg", exOd.Average))
+			}
+		}
 		lock.Lock()
 		oldList := utils2.ValsOfMap(openOds)
 		lock.Unlock()
-		return oldList, nil, nil, nil
+		return oldList, newSpot, nil, nil
 	}
 	// Get exchange positions
 	// 获取交易所仓位
@@ -1897,9 +1956,24 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			cancelTriggerOds(od, o.Account)
 			o.callBack(od, isEnter)
 			return nil
-		} else {
-			return err
 		}
+		// SSTWAP: local book thinks we're long but lane has no WPLS — already flat on-chain.
+		// Clear the ghost without retrying sellPct every bar (rip harvest / TP spam).
+		if !isEnter && err.Code == errs.CodeParamInvalid {
+			msg := err.Message()
+			if strings.Contains(msg, "zero WPLS for sellPct") || strings.Contains(msg, "sell amount is zero") {
+				log.Warn("sstwap sell skipped — lane already flat on-chain",
+					zap.String("acc", o.Account), zap.String("key", od.Key()), zap.String("detail", msg))
+				err = od.LocalExit(btime.UTCStamp(), "already_flat", price, msg, banexg.OdTypeMarket)
+				if err != nil {
+					return err
+				}
+				cancelTriggerOds(od, o.Account)
+				o.callBack(od, isEnter)
+				return nil
+			}
+		}
+		return err
 	}
 	err = o.updateOdByExgRes(od, isEnter, res)
 	if err != nil {
@@ -2916,6 +2990,10 @@ func calcFatalLoss(wallets *BanWallets, orders []*ormo.InOutOrder, backMins int)
 	}
 	lossVal := math.Abs(sumProfit)
 	totalLegal := wallets.TotalLegal(nil, false)
+	if totalLegal <= 1e-9 {
+		// No priced wallet equity — cannot compute a loss rate; do not ban entries.
+		return 0
+	}
 	return lossVal / (lossVal + totalLegal)
 }
 
@@ -2942,6 +3020,19 @@ func (o *LiveOrderMgr) ExitAndFill(orders []*ormo.InOutOrder, req *strat.ExitReq
 
 func (o *LiveOrderMgr) CleanUp() *errs.Error {
 	return nil
+}
+
+// parseSstwapLaneOrderID reads lane id from sstwap FetchOpenOrders ids ("sstwap-lane-N").
+func parseSstwapLaneOrderID(id string) (int, bool) {
+	const prefix = "sstwap-lane-"
+	if !strings.HasPrefix(id, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(id, prefix))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 func StartLiveOdMgr() {
