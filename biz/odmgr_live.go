@@ -322,8 +322,12 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		delSaveOrders(o.Account, delOds, saveOds)
 	}
 	if !banexg.IsContract(core.Market) {
-		// Spot (SSTWAP): adopt untracked FetchOpenOrders when take_over_strat is set.
-		// Contract markets use positions below; spot has no FetchPositions.
+		// Spot (SSTWAP) recovery-only take-over:
+		// Adopt existing on-chain lane bags (sstwap-lane-N) into local L{n}_in so hub
+		// sell / terminator / trailing can address them after restart.
+		// Never CreateOrder / never invent a new on-chain position — every NEW buy must
+		// come from strategy OpenOrder (hub arm + observation shop).
+		// Mid-session inventory creation via TrialUnMatches/traceExgOrder is disabled for spot.
 		var newSpot []*ormo.InOutOrder
 		if config.TakeOverStrat != "" {
 			tracked := make(map[string]bool)
@@ -338,8 +342,14 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 				if exOd == nil || tracked[exOd.ID] || exOd.Filled <= AmtDust {
 					continue
 				}
+				laneID, ok := parseSstwapLaneOrderID(exOd.ID)
+				if !ok {
+					log.Warn("take over spot skip: not a lane bag", zap.String("acc", o.Account),
+						zap.String("exgId", exOd.ID), zap.String("symbol", exOd.Symbol))
+					continue
+				}
 				if exOd.Average <= 0 {
-					// Cost-basis missing — stamp live mark so take-over still books.
+					// Cost-basis missing — stamp live mark so recovery still books.
 					if px := com.GetPriceSafe(exOd.Symbol, ""); px > 0 {
 						exOd.Average = px
 						exOd.Price = px
@@ -358,15 +368,14 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 				feeName, feeCost, feeQuote := getFeeNameCost(exOd.Fee, exOd.Symbol, "", exOd.Side, exOd.Filled, exOd.Average)
 				iod := o.createInOutOd(exs, false, exOd.Average, exOd.Filled, exOd.Type, feeCost, feeQuote, feeName,
 					exOd.Timestamp, ormo.OdStatusClosed, exOd.ID, defTF)
-				if laneID, ok := parseSstwapLaneOrderID(exOd.ID); ok {
-					iod.EnterTag = fmt.Sprintf("L%d_in", laneID)
-					if iod.Info == nil {
-						iod.Info = map[string]interface{}{}
-					}
-					iod.Info["laneId"] = fmt.Sprintf("%d", laneID)
-					iod.DirtyMain = true
-					iod.DirtyInfo = true
+				iod.EnterTag = fmt.Sprintf("L%d_in", laneID)
+				if iod.Info == nil {
+					iod.Info = map[string]interface{}{}
 				}
+				iod.Info["laneId"] = fmt.Sprintf("%d", laneID)
+				iod.Info["takeOverRecovery"] = true
+				iod.DirtyMain = true
+				iod.DirtyInfo = true
 				if saveErr := iod.Save(); saveErr != nil {
 					log.Error("take over spot: save fail", zap.String("acc", o.Account), zap.Error(saveErr))
 					continue
@@ -375,8 +384,9 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 				openOds[iod.ID] = iod
 				lock.Unlock()
 				newSpot = append(newSpot, iod)
-				log.Info("take over spot open order", zap.String("acc", o.Account),
+				log.Info("take over spot recovery", zap.String("acc", o.Account),
 					zap.String("key", iod.Key()), zap.String("exgId", exOd.ID),
+					zap.Int("laneId", laneID),
 					zap.Float64("filled", exOd.Filled), zap.Float64("avg", exOd.Average))
 			}
 		}
@@ -1523,7 +1533,9 @@ func (o *LiveOrderMgr) TrialUnMatchesForever() {
 				}
 			}
 			unHandleNum := 0
-			allowTakeOver := config.TakeOverStrat != ""
+			// Spot take-over is recovery-only (SyncExgOrders). Do not invent mid-session
+			// entry inventory from unmatched buys — new positions must come from hub OpenOrder.
+			allowTakeOver := config.TakeOverStrat != "" && banexg.IsContract(core.Market)
 			// Traverse third-party orders to check whether they are closed or tracked
 			// 遍历第三方订单，检查是否平仓或跟踪
 			for _, trades := range pairTrades {

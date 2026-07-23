@@ -56,8 +56,9 @@ func exitByMyOrder(o *LiveOrderMgr) FuncHandleMyOrder {
 				break
 			}
 		}
-		// 检查是否有剩余数量，创建相反订单 Check if there is a remaining quantity and create an opposite order
-		createInv := !od.ReduceOnly && filled > AmtDust && config.TakeOverStrat != ""
+		// Residual inventory from third-party fills: contracts only.
+		// Spot must not open new longs mid-session via take-over (recovery is SyncExgOrders).
+		createInv := !od.ReduceOnly && filled > AmtDust && config.TakeOverStrat != "" && banexg.IsContract(core.Market)
 		if len(doneParts) == 0 && !createInv {
 			return true
 		}
