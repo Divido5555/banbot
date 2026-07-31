@@ -5,6 +5,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/banbox/banbot/btime"
@@ -865,6 +866,8 @@ func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 // clearPhantomExitStuck LocalExits open orders that match the exit request filters
 // except they were skipped because ExitTag / Exit.Amount was already set without FullExit.
 // Pool-agnostic book hygiene — does not inspect chain inventory or pair symbols beyond the request.
+// SSTWAP: never LocalExit while a lane still has a broadcast-but-unconfirmed tx — that orphaned
+// L3 WPLS when hub re-fired self_rev during WaitMined (01:12–01:13Z Jul 31).
 func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*ormo.InOutOrder {
 	if req == nil || req.OrderID > 0 {
 		return nil
@@ -905,6 +908,12 @@ func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*or
 		if !stuck {
 			continue
 		}
+		if sstwapLanePendingForOrder(od) {
+			log.Warn("skip phantom clear — sstwap lane tx still pending",
+				zap.String("acc", o.Account), zap.String("key", od.Key()),
+				zap.String("enterTag", od.EnterTag))
+			continue
+		}
 		phantoms = append(phantoms, od)
 	}
 	lock.Unlock()
@@ -933,6 +942,45 @@ func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*or
 			zap.Strings("orders", keys))
 	}
 	return cleared
+}
+
+// sstwapLanePendingForOrder is true when EnterTag L{n}_* maps to a lane with an
+// in-flight sstwap tx (BotExchange / *sstwap.Exchange via LaneHasPendingTx).
+func sstwapLanePendingForOrder(od *ormo.InOutOrder) bool {
+	if od == nil || exg.Default == nil {
+		return false
+	}
+	type pendingHost interface {
+		LaneHasPendingTx(laneID uint64) bool
+	}
+	h, ok := exg.Default.(pendingHost)
+	if !ok {
+		return false
+	}
+	lid := -1
+	if v := od.GetInfoString("laneId"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			lid = n
+		}
+	}
+	if lid < 0 {
+		tag := od.EnterTag
+		if len(tag) >= 3 && tag[0] == 'L' {
+			i := 1
+			for i < len(tag) && tag[i] >= '0' && tag[i] <= '9' {
+				i++
+			}
+			if i > 1 && i < len(tag) && tag[i] == '_' {
+				if n, err := strconv.Atoi(tag[1:i]); err == nil {
+					lid = n
+				}
+			}
+		}
+	}
+	if lid < 0 {
+		return false
+	}
+	return h.LaneHasPendingTx(uint64(lid))
 }
 
 func (o *OrderMgr) CleanUp() *errs.Error {
