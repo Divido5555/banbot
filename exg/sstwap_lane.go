@@ -1,6 +1,8 @@
 package exg
 
 import (
+	"strconv"
+
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banexg/sstwap"
 )
@@ -19,6 +21,12 @@ func AttachSstwapOrderParams(enterTag string, getInfo func(string) string, param
 	}
 	if v := getInfo("laneId"); v != "" {
 		params[sstwap.ParamLaneID] = v
+	}
+	// Hub decision mark (DAI/WPLS) for minOut lock — buys (maxPrice) and sells (stop mark).
+	if v := getInfo("decisionMarkDAI"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			params[sstwap.ParamDecisionMark] = f
+		}
 	}
 	sstwap.EnrichOrderParams(params)
 }

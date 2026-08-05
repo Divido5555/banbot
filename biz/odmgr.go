@@ -1,12 +1,14 @@
 package biz
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
@@ -19,6 +21,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/banbox/banexg/sstwap"
 	"github.com/banbox/banexg/utils"
 	"go.uber.org/zap"
 )
@@ -561,15 +564,20 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 		}
 		lock.Unlock()
 	}
+	// Always sweep ExitTag-stuck incompletes in live mode — not only when matches==0.
+	// A real take-over sibling (no ExitTag) used to leave the stuck OD in place, so
+	// LaneExitInFlight stayed true and hub sells were skipped (L3 #1496 beside #1499).
+	var clearedStuck []*ormo.InOutOrder
+	if core.LiveMode && req.OrderID <= 0 {
+		clearedStuck = o.clearPhantomExitStuck(pairs, req)
+	}
 	if len(matches) == 0 {
 		if core.LiveMode {
 			fields := req.GetZapFields(nil, zap.String("acc", o.Account), zap.String("pair", pairs),
 				zap.Int("all", len(openOds)))
 			log.Warn("no match orders to exit", fields...)
-			// Ghost hygiene: open ODs skipped only because ExitTag/Exit.Amount was already
-			// set never reach FullExit → sticky HasLongOnLane / accOdNums. LocalExit them.
-			if cleared := o.clearPhantomExitStuck(pairs, req); len(cleared) > 0 {
-				return cleared, nil
+			if len(clearedStuck) > 0 {
+				return clearedStuck, nil
 			}
 		}
 		return nil, nil
@@ -715,7 +723,15 @@ func (o *OrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InO
 
 func (o *OrderMgr) ExitOrder(od *ormo.InOutOrder, req *strat.ExitReq) (*ormo.InOutOrder, *errs.Error) {
 	if od.ExitTag != "" || (od.Exit != nil && od.Exit.Amount > 0) {
-		// Exit一旦有值，表示全部退出
+		// Exit once set normally means "fully exiting". Force re-queues when the
+		// exit never filled (sell reverted / WaitMined error) so ghost_flat can
+		// clear stuck ExitTag longs — ExitOrder used to no-op forever (L0 #1493).
+		if req != nil && req.Force && od.Status < ormo.InOutStatusFullExit {
+			exitDone := od.Exit != nil && od.Exit.Status >= ormo.OdStatusClosed && od.Exit.Filled > 0
+			if !exitDone {
+				return o.postOrderExit(od)
+			}
+		}
 		return nil, nil
 	}
 	if req.Dirt != 0 && (req.Dirt < 0) != od.Short {
@@ -865,9 +881,8 @@ func (o *OrderMgr) finishOrder(od *ormo.InOutOrder) *errs.Error {
 
 // clearPhantomExitStuck LocalExits open orders that match the exit request filters
 // except they were skipped because ExitTag / Exit.Amount was already set without FullExit.
-// Pool-agnostic book hygiene — does not inspect chain inventory or pair symbols beyond the request.
-// SSTWAP: never LocalExit while a lane still has a broadcast-but-unconfirmed tx — that orphaned
-// L3 WPLS when hub re-fired self_rev during WaitMined (01:12–01:13Z Jul 31).
+// SSTWAP safety: never LocalExit while lane tx pending, and never while lane still has
+// on-chain WPLS (2026-07-31: SyncExg sweep LocalExited L1 take-over → orphaned bag).
 func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*ormo.InOutOrder {
 	if req == nil || req.OrderID > 0 {
 		return nil
@@ -914,6 +929,16 @@ func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*or
 				zap.String("enterTag", od.EnterTag))
 			continue
 		}
+		if flat, ok := sstwapLaneZeroWPLS(od); ok && !flat {
+			// Lane bag still exists — only LocalExit this OD if a sibling open long
+			// (no ExitTag) owns the inventory. Otherwise we'd orphan the bag.
+			if !hasOpenLaneSibling(openOds, od) {
+				log.Warn("skip phantom clear — lane still has on-chain WPLS",
+					zap.String("acc", o.Account), zap.String("key", od.Key()),
+					zap.String("enterTag", od.EnterTag))
+				continue
+			}
+		}
 		phantoms = append(phantoms, od)
 	}
 	lock.Unlock()
@@ -942,6 +967,78 @@ func (o *OrderMgr) clearPhantomExitStuck(pairs string, req *strat.ExitReq) []*or
 			zap.Strings("orders", keys))
 	}
 	return cleared
+}
+
+// hasOpenLaneSibling is true when another open long shares the lane/EnterTag
+// without an in-flight ExitTag (typically a take-over recovery OD).
+func hasOpenLaneSibling(openOds map[int64]*ormo.InOutOrder, od *ormo.InOutOrder) bool {
+	if od == nil || openOds == nil {
+		return false
+	}
+	lane := od.GetInfoString("laneId")
+	for id, other := range openOds {
+		if other == nil || id == od.ID || other.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		if other.Short != od.Short || other.Symbol != od.Symbol {
+			continue
+		}
+		if other.ExitTag != "" || (other.Exit != nil && other.Exit.Amount > 0) {
+			continue
+		}
+		if other.EnterTag == od.EnterTag {
+			return true
+		}
+		if lane != "" && other.GetInfoString("laneId") == lane {
+			return true
+		}
+	}
+	return false
+}
+
+// sstwapLaneZeroWPLS reports whether the order's lane has zero WPLS.
+// ok=false when probe unavailable (caller must not assume flat).
+func sstwapLaneZeroWPLS(od *ormo.InOutOrder) (flat bool, ok bool) {
+	if od == nil || exg.Default == nil {
+		return false, false
+	}
+	type stateHost interface {
+		LaneState(ctx context.Context, laneID uint64) (*sstwap.LaneState, *errs.Error)
+	}
+	h, hostOK := exg.Default.(stateHost)
+	if !hostOK {
+		return false, false
+	}
+	lid := -1
+	if v := od.GetInfoString("laneId"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			lid = n
+		}
+	}
+	if lid < 0 {
+		tag := od.EnterTag
+		if len(tag) >= 3 && tag[0] == 'L' {
+			i := 1
+			for i < len(tag) && tag[i] >= '0' && tag[i] <= '9' {
+				i++
+			}
+			if i > 1 && i < len(tag) && tag[i] == '_' {
+				if n, err := strconv.Atoi(tag[1:i]); err == nil {
+					lid = n
+				}
+			}
+		}
+	}
+	if lid < 0 {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	st, err := h.LaneState(ctx, uint64(lid))
+	if err != nil || st == nil || st.TokenBalWPLS == nil {
+		return false, false
+	}
+	return st.TokenBalWPLS.Sign() <= 0, true
 }
 
 // sstwapLanePendingForOrder is true when EnterTag L{n}_* maps to a lane with an

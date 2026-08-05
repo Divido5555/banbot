@@ -342,6 +342,18 @@ func (t *Trader) onAccountDataSeries(account string, env *ta.BarEnv, evt *orm.Da
 
 func (t *Trader) onAccountDataSeriesJob(odMgr IOrderMgr, job *strat.StratJob, evt *orm.DataSeries, barExpired bool) *errs.Error {
 	account := job.Account
+	// Mid-session orphan recovery: book on-chain lane bags with no local long, then
+	// force-exit (unsticks L0-style inventory hub skips as no_local_long).
+	if core.LiveMode && !job.IsWarmUp {
+		if live, ok := odMgr.(*LiveOrderMgr); ok {
+			if adopted := live.AdoptOrphanSpotLanes(); len(adopted) > 0 {
+				openOds, lock := ormo.GetOpenODs(account)
+				lock.Lock()
+				job.UpdateOrders(utils2.ValsOfMap(openOds))
+				lock.Unlock()
+			}
+		}
+	}
 	if job.Strat.OnData != nil {
 		job.Strat.OnData(job, evt)
 	} else {

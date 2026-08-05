@@ -1,11 +1,13 @@
 package biz
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
 	"github.com/banbox/banexg/log"
+	"github.com/banbox/banexg/sstwap"
 	utils2 "github.com/banbox/banexg/utils"
 	"github.com/sasha-s/go-deadlock"
 	"go.uber.org/zap"
@@ -46,6 +49,10 @@ type LiveOrderMgr struct {
 	lockUnMatches    deadlock.Mutex             // Prevent concurrent reading and writing of unMatchTrades 防止并发读写unMatchTrades
 	exitByMyOrder    FuncHandleMyOrder          // Try to use the transaction results of other end operations to update the current order status 尝试使用其他端操作的交易结果，更新当前订单状态
 	traceExgOrder    FuncHandleMyOrder
+	// laneQMu serializes handleOrderQueue per Slot-1 lane so one lane's CreateOrder
+	// WaitMined cannot block another lane's exit/reconcile (2026-07-31 five-GHOST jam).
+	laneQMu   map[int]*sync.Mutex
+	laneQMuLk sync.Mutex
 }
 
 type OdQItem struct {
@@ -105,6 +112,7 @@ func newLiveOrderMgr(account string, callBack func(od *ormo.InOutOrder, isEnter 
 		exgIdMap:      map[string]*ormo.InOutOrder{},
 		doneTrades:    map[string]int64{},
 		unMatchTrades: map[string]*banexg.MyTrade{},
+		laneQMu:       map[int]*sync.Mutex{},
 	}
 	res.afterEnter = makeAfterEnter(res)
 	res.afterExit = makeAfterExit(res)
@@ -325,71 +333,31 @@ func (o *LiveOrderMgr) SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, 
 		// Spot (SSTWAP) recovery-only take-over:
 		// Adopt existing on-chain lane bags (sstwap-lane-N) into local L{n}_in so hub
 		// sell / terminator / trailing can address them after restart.
-		// Never CreateOrder / never invent a new on-chain position — every NEW buy must
-		// come from strategy OpenOrder (hub arm + observation shop).
-		// Mid-session inventory creation via TrialUnMatches/traceExgOrder is disabled for spot.
-		var newSpot []*ormo.InOutOrder
-		if config.TakeOverStrat != "" {
-			tracked := make(map[string]bool)
-			lock.Lock()
-			for _, od := range openOds {
-				if od.Enter != nil && od.Enter.OrderID != "" {
-					tracked[od.Enter.OrderID] = true
+		// Book bags here. Hub-cascade orphans (L0–L2) force-exit immediately so
+		// they cannot wait on the next up-cross. L3–L4 ride take-overs survive restart.
+		newSpot := o.adoptUntrackedSpotBags(exOdList)
+		var hubCascadeOrphans []*ormo.InOutOrder
+		for _, iod := range newSpot {
+			lid := -1
+			if s := iod.GetInfoString("laneId"); s != "" {
+				if n, aerr := strconv.Atoi(s); aerr == nil {
+					lid = n
 				}
 			}
-			lock.Unlock()
-			for _, exOd := range exOdList {
-				if exOd == nil || tracked[exOd.ID] || exOd.Filled <= AmtDust {
-					continue
-				}
-				laneID, ok := parseSstwapLaneOrderID(exOd.ID)
-				if !ok {
-					log.Warn("take over spot skip: not a lane bag", zap.String("acc", o.Account),
-						zap.String("exgId", exOd.ID), zap.String("symbol", exOd.Symbol))
-					continue
-				}
-				if exOd.Average <= 0 {
-					// Cost-basis missing — stamp live mark so recovery still books.
-					if px := com.GetPriceSafe(exOd.Symbol, ""); px > 0 {
-						exOd.Average = px
-						exOd.Price = px
-					}
-				}
-				exs, exsErr := orm.GetExSymbolCur(exOd.Symbol)
-				if exsErr != nil {
-					log.Error("take over spot: symbol fail", zap.String("acc", o.Account),
-						zap.String("symbol", exOd.Symbol), zap.Error(exsErr))
-					continue
-				}
-				defTF := config.GetTakeOverTF(exOd.Symbol, "1m")
-				if defTF == "" {
-					defTF = "1m"
-				}
-				feeName, feeCost, feeQuote := getFeeNameCost(exOd.Fee, exOd.Symbol, "", exOd.Side, exOd.Filled, exOd.Average)
-				iod := o.createInOutOd(exs, false, exOd.Average, exOd.Filled, exOd.Type, feeCost, feeQuote, feeName,
-					exOd.Timestamp, ormo.OdStatusClosed, exOd.ID, defTF)
-				iod.EnterTag = fmt.Sprintf("L%d_in", laneID)
-				if iod.Info == nil {
-					iod.Info = map[string]interface{}{}
-				}
-				iod.Info["laneId"] = fmt.Sprintf("%d", laneID)
-				iod.Info["takeOverRecovery"] = true
-				iod.DirtyMain = true
-				iod.DirtyInfo = true
-				if saveErr := iod.Save(); saveErr != nil {
-					log.Error("take over spot: save fail", zap.String("acc", o.Account), zap.Error(saveErr))
-					continue
-				}
-				lock.Lock()
-				openOds[iod.ID] = iod
-				lock.Unlock()
-				newSpot = append(newSpot, iod)
-				log.Info("take over spot recovery", zap.String("acc", o.Account),
-					zap.String("key", iod.Key()), zap.String("exgId", exOd.ID),
-					zap.Int("laneId", laneID),
-					zap.Float64("filled", exOd.Filled), zap.Float64("avg", exOd.Average))
+			if lid >= 0 && lid < 3 {
+				hubCascadeOrphans = append(hubCascadeOrphans, iod)
 			}
 		}
+		if len(hubCascadeOrphans) > 0 {
+			o.forceExitAdoptedOrphans(hubCascadeOrphans)
+		}
+		// Restart can leave ExitTag-stuck locals (exit never re-queued).
+		// Flat lanes → LocalExit; lanes still holding WPLS → re-queue sell.
+		if cleared := o.clearPhantomExitStuck("", &strat.ExitReq{}); len(cleared) > 0 {
+			log.Warn("SyncExgOrders cleared exit-stuck opens after spot recovery",
+				zap.String("acc", o.Account), zap.Int("n", len(cleared)))
+		}
+		o.requeueInventoryStuckExits()
 		lock.Lock()
 		oldList := utils2.ValsOfMap(openOds)
 		lock.Unlock()
@@ -1227,9 +1195,125 @@ func (o *LiveOrderMgr) ConsumeOrderQueue() {
 			case item = <-o.queue:
 				break
 			}
-			o.handleOrderQueue(item.Order, item.Action)
+			// Dispatch per-lane: WaitMined on L0 must not stall L1–L4 ghost_flat/hub exits.
+			lid := laneIDFromOrder(item.Order)
+			go o.handleOrderQueueLane(lid, item)
 		}
 	}()
+}
+
+func laneIDFromOrder(od *ormo.InOutOrder) int {
+	if od == nil {
+		return -1
+	}
+	if s := od.GetInfoString("laneId"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 && n <= 4 {
+			return n
+		}
+	}
+	tag := od.EnterTag
+	if len(tag) >= 3 && tag[0] == 'L' {
+		underscore := strings.IndexByte(tag, '_')
+		if underscore >= 2 {
+			id := 0
+			ok := true
+			for i := 1; i < underscore; i++ {
+				if tag[i] < '0' || tag[i] > '9' {
+					ok = false
+					break
+				}
+				id = id*10 + int(tag[i]-'0')
+			}
+			if ok && id >= 0 && id <= 4 {
+				return id
+			}
+		}
+	}
+	return -1
+}
+
+// requeueInventoryStuckExits pushes OdActionExit for ExitTag-stuck opens that still
+// have on-chain WPLS (and no pending tx). clearPhantomExitStuck correctly refuses
+// LocalExit in that case — without a re-queue, hub sees exitFlight forever (L2/L3).
+func (o *LiveOrderMgr) requeueInventoryStuckExits() {
+	if o == nil || o.queue == nil {
+		return
+	}
+	openOds, lock := ormo.GetOpenODs(o.Account)
+	lock.Lock()
+	var stuck []*ormo.InOutOrder
+	for _, od := range openOds {
+		if od == nil || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		if od.ExitTag == "" && (od.Exit == nil || od.Exit.Amount <= 0) {
+			continue
+		}
+		if od.Exit != nil && od.Exit.Status >= ormo.OdStatusClosed && od.Exit.Filled > 0 {
+			continue
+		}
+		if sstwapLanePendingForOrder(od) {
+			continue
+		}
+		flat, ok := sstwapLaneZeroWPLS(od)
+		if !ok || flat {
+			continue
+		}
+		stuck = append(stuck, od)
+	}
+	lock.Unlock()
+	for _, od := range stuck {
+		log.Warn("re-queue exit for inventory-stuck order",
+			zap.String("acc", o.Account), zap.String("key", od.Key()),
+			zap.String("exitTag", od.ExitTag))
+		o.queue <- &OdQItem{Order: od, Action: ormo.OdActionExit}
+	}
+}
+
+// sstwapLaneAlreadyFlat is true when the order's lane reports zero WPLS on-chain.
+func (o *LiveOrderMgr) sstwapLaneAlreadyFlat(od *ormo.InOutOrder) bool {
+	if od == nil || exg.Default == nil {
+		return false
+	}
+	lid := laneIDFromOrder(od)
+	if lid < 0 {
+		return false
+	}
+	type stateHost interface {
+		LaneState(ctx context.Context, laneID uint64) (*sstwap.LaneState, *errs.Error)
+	}
+	h, ok := exg.Default.(stateHost)
+	if !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	st, err := h.LaneState(ctx, uint64(lid))
+	if err != nil || st == nil || st.TokenBalWPLS == nil {
+		return false
+	}
+	return st.TokenBalWPLS.Sign() <= 0
+}
+
+func (o *LiveOrderMgr) laneQueueMu(laneID int) *sync.Mutex {
+	o.laneQMuLk.Lock()
+	defer o.laneQMuLk.Unlock()
+	if o.laneQMu == nil {
+		o.laneQMu = map[int]*sync.Mutex{}
+	}
+	mu, ok := o.laneQMu[laneID]
+	if !ok {
+		mu = &sync.Mutex{}
+		o.laneQMu[laneID] = mu
+	}
+	return mu
+}
+
+func (o *LiveOrderMgr) handleOrderQueueLane(laneID int, item *OdQItem) {
+	mu := o.laneQueueMu(laneID)
+	mu.Lock()
+	defer mu.Unlock()
+	o.handleOrderQueue(item.Order, item.Action)
 }
 
 func (o *LiveOrderMgr) handleOrderQueue(od *ormo.InOutOrder, action string) {
@@ -1975,6 +2059,22 @@ func (o *LiveOrderMgr) submitExgOrder(od *ormo.InOutOrder, isEnter bool) *errs.E
 			msg := err.Message()
 			if strings.Contains(msg, "zero WPLS for sellPct") || strings.Contains(msg, "sell amount is zero") {
 				log.Warn("sstwap sell skipped — lane already flat on-chain",
+					zap.String("acc", o.Account), zap.String("key", od.Key()), zap.String("detail", msg))
+				err = od.LocalExit(btime.UTCStamp(), "already_flat", price, msg, banexg.OdTypeMarket)
+				if err != nil {
+					return err
+				}
+				cancelTriggerOds(od, o.Account)
+				o.callBack(od, isEnter)
+				return nil
+			}
+		}
+		// Sell mined status=0 after a prior successful sell (or race): lane is flat.
+		// Without LocalExit the order keeps ExitTag and ExitOrder no-ops → permanent GHOST.
+		if !isEnter && err.Code == errs.CodeInvalidResponse && strings.Contains(err.Message(), "reverted") {
+			if o.sstwapLaneAlreadyFlat(od) {
+				msg := err.Message()
+				log.Warn("sstwap sell reverted — lane already flat on-chain",
 					zap.String("acc", o.Account), zap.String("key", od.Key()), zap.String("detail", msg))
 				err = od.LocalExit(btime.UTCStamp(), "already_flat", price, msg, banexg.OdTypeMarket)
 				if err != nil {
@@ -3042,6 +3142,155 @@ func parseSstwapLaneOrderID(id string) (int, bool) {
 	}
 	n, err := strconv.Atoi(strings.TrimPrefix(id, prefix))
 	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// adoptUntrackedSpotBags books local L{n}_in for on-chain sstwap-lane-N bags that have
+// no matching open OrderID / EnterTag. Does not CreateOrder — recovery only.
+func (o *LiveOrderMgr) adoptUntrackedSpotBags(exOdList []*banexg.Order) []*ormo.InOutOrder {
+	if o == nil || config.TakeOverStrat == "" || len(exOdList) == 0 {
+		return nil
+	}
+	openOds, lock := ormo.GetOpenODs(o.Account)
+	tracked := make(map[string]bool)
+	laneBooked := make(map[int]bool)
+	lock.Lock()
+	for _, od := range openOds {
+		if od == nil || od.Status >= ormo.InOutStatusFullExit {
+			continue
+		}
+		if od.Enter != nil && od.Enter.OrderID != "" {
+			tracked[od.Enter.OrderID] = true
+		}
+		if lid, ok := parseLaneEnterTag(od.EnterTag); ok {
+			laneBooked[lid] = true
+		}
+	}
+	lock.Unlock()
+
+	var newSpot []*ormo.InOutOrder
+	for _, exOd := range exOdList {
+		if exOd == nil || tracked[exOd.ID] || exOd.Filled <= AmtDust {
+			continue
+		}
+		laneID, ok := parseSstwapLaneOrderID(exOd.ID)
+		if !ok {
+			log.Warn("take over spot skip: not a lane bag", zap.String("acc", o.Account),
+				zap.String("exgId", exOd.ID), zap.String("symbol", exOd.Symbol))
+			continue
+		}
+		if laneBooked[laneID] {
+			continue
+		}
+		if exOd.Average <= 0 {
+			if px := com.GetPriceSafe(exOd.Symbol, ""); px > 0 {
+				exOd.Average = px
+				exOd.Price = px
+			}
+		}
+		exs, exsErr := orm.GetExSymbolCur(exOd.Symbol)
+		if exsErr != nil {
+			log.Error("take over spot: symbol fail", zap.String("acc", o.Account),
+				zap.String("symbol", exOd.Symbol), zap.Error(exsErr))
+			continue
+		}
+		defTF := config.GetTakeOverTF(exOd.Symbol, "1m")
+		if defTF == "" {
+			defTF = "1m"
+		}
+		feeName, feeCost, feeQuote := getFeeNameCost(exOd.Fee, exOd.Symbol, "", exOd.Side, exOd.Filled, exOd.Average)
+		iod := o.createInOutOd(exs, false, exOd.Average, exOd.Filled, exOd.Type, feeCost, feeQuote, feeName,
+			exOd.Timestamp, ormo.OdStatusClosed, exOd.ID, defTF)
+		iod.EnterTag = fmt.Sprintf("L%d_in", laneID)
+		if iod.Info == nil {
+			iod.Info = map[string]interface{}{}
+		}
+		iod.Info["laneId"] = fmt.Sprintf("%d", laneID)
+		iod.Info["takeOverRecovery"] = true
+		iod.DirtyMain = true
+		iod.DirtyInfo = true
+		if saveErr := iod.Save(); saveErr != nil {
+			log.Error("take over spot: save fail", zap.String("acc", o.Account), zap.Error(saveErr))
+			continue
+		}
+		lock.Lock()
+		openOds[iod.ID] = iod
+		lock.Unlock()
+		laneBooked[laneID] = true
+		tracked[exOd.ID] = true
+		newSpot = append(newSpot, iod)
+		log.Info("take over spot recovery", zap.String("acc", o.Account),
+			zap.String("key", iod.Key()), zap.String("exgId", exOd.ID),
+			zap.Int("laneId", laneID),
+			zap.Float64("filled", exOd.Filled), zap.Float64("avg", exOd.Average))
+	}
+	return newSpot
+}
+
+// AdoptOrphanSpotLanes mid-session: book any on-chain lane bag with no local long, then
+// Force-exit so hub/terminator are not required to notice HasLongOnLane (L0 orphan 2026-07-31).
+func (o *LiveOrderMgr) AdoptOrphanSpotLanes() []*ormo.InOutOrder {
+	if o == nil || !core.LiveMode || banexg.IsContract(core.Market) || config.TakeOverStrat == "" {
+		return nil
+	}
+	exchange := exg.Default
+	if exchange == nil {
+		return nil
+	}
+	exOdList, err := exchange.FetchOpenOrders("", 0, 1000, map[string]interface{}{
+		banexg.ParamAccount:     o.Account,
+		banexg.ParamSettleCoins: config.StakeCurrency,
+	})
+	if err != nil {
+		log.Warn("AdoptOrphanSpotLanes FetchOpenOrders fail", zap.String("acc", o.Account), zap.Error(err))
+		return nil
+	}
+	adopted := o.adoptUntrackedSpotBags(exOdList)
+	o.forceExitAdoptedOrphans(adopted)
+	return adopted
+}
+
+// forceExitAdoptedOrphans queues sellPct for freshly booked take-over longs so
+// orphan inventory cannot sit until the next hub cross/terminator.
+func (o *LiveOrderMgr) forceExitAdoptedOrphans(adopted []*ormo.InOutOrder) {
+	for _, iod := range adopted {
+		if iod == nil {
+			continue
+		}
+		lid := -1
+		if s := iod.GetInfoString("laneId"); s != "" {
+			if n, aerr := strconv.Atoi(s); aerr == nil {
+				lid = n
+			}
+		}
+		tag := "orphan_exit"
+		if lid >= 0 {
+			tag = fmt.Sprintf("L%d_orphan_exit", lid)
+		}
+		_, xerr := o.ExitOrder(iod, &strat.ExitReq{Tag: tag, Force: true})
+		if xerr != nil {
+			log.Error("forceExitAdoptedOrphans exit fail", zap.String("acc", o.Account),
+				zap.String("key", iod.Key()), zap.Error(xerr))
+			continue
+		}
+		log.Warn("force-exit orphan bag",
+			zap.String("acc", o.Account), zap.String("key", iod.Key()),
+			zap.String("exitTag", tag), zap.Int("laneId", lid))
+	}
+}
+
+func parseLaneEnterTag(tag string) (int, bool) {
+	if len(tag) < 3 || tag[0] != 'L' {
+		return 0, false
+	}
+	underscore := strings.IndexByte(tag, '_')
+	if underscore < 2 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(tag[1:underscore])
+	if err != nil || n < 0 || n > 4 {
 		return 0, false
 	}
 	return n, true
